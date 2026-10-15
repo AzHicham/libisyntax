@@ -394,6 +394,27 @@ static void tile_array_unpin(isyntax_cache_t* cache, const tile_array_t* array) 
     }
 }
 
+int64_t isyntax_cache_used_bytes(isyntax_cache_t* cache) {
+    return (int64_t)(block_allocator_used_bytes(cache->ll_coeff_block_allocator) +
+                     block_allocator_used_bytes(cache->h_coeff_block_allocator));
+}
+
+void isyntax_cache_drop_tile(isyntax_cache_t* cache, isyntax_tile_t* tile) {
+    tile_list_remove(&cache->cache_list, tile);
+    for (int i = 0; i < 3; ++i) {
+        if (tile->color_channels[i].coeff_ll) {
+            block_free(cache->ll_coeff_block_allocator, tile->color_channels[i].coeff_ll);
+            tile->color_channels[i].coeff_ll = NULL;
+        }
+        if (tile->color_channels[i].coeff_h) {
+            block_free(cache->h_coeff_block_allocator, tile->color_channels[i].coeff_h);
+            tile->color_channels[i].coeff_h = NULL;
+        }
+    }
+    tile->has_ll = false;
+    tile->has_h = false;
+}
+
 void isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, int tile_x, int tile_y,
                        uint32_t* pixels_buffer, enum isyntax_pixel_format_t pixel_format) {
     // The cache lock guards the tiles' cache fields and the lists, and is released while decoding and transforming:
@@ -465,21 +486,10 @@ void isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, in
 
     // Cache trim. Since we have the result already, it is possible that tiles from this run will be trimmed here
     // if cache is small or work happened on other threads. Tiles other reads use are not in the list.
-    while (cache->cache_list.count > cache->target_cache_size) {
-        isyntax_tile_t* tile = cache->cache_list.tail;
-        tile_list_remove(&cache->cache_list, tile);
-        for (int i = 0; i < 3; ++i) {
-            if (tile->has_ll) {
-                block_free(cache->ll_coeff_block_allocator, tile->color_channels[i].coeff_ll);
-                tile->color_channels[i].coeff_ll = NULL;
-            }
-            if (tile->has_h) {
-                block_free(cache->h_coeff_block_allocator, tile->color_channels[i].coeff_h);
-                tile->color_channels[i].coeff_h = NULL;
-            }
-        }
-        tile->has_ll = false;
-        tile->has_h = false;
+    while (cache->cache_list.tail &&
+           (cache->cache_list.count > cache->target_cache_size ||
+            (cache->capacity_bytes > 0 && isyntax_cache_used_bytes(cache) > cache->capacity_bytes))) {
+        isyntax_cache_drop_tile(cache, cache->cache_list.tail);
     }
 
     // Prevent iSyntax streamer from calling isyntax_begin_first_load()

@@ -1,5 +1,6 @@
-// Tiles read by many threads sharing one cache have the pixels of tiles read by a single thread. The cache is small,
-// so that the threads evict the tiles of each other while reading.
+// Tiles read by many threads sharing one cache have the pixels of tiles read by a single thread. Two isyntax objects
+// of the slide share the cache, which is small, so that the threads evict the tiles of each other while reading.
+// Flushing the tiles of one isyntax frees its coefficients only.
 #include "common.h"
 
 #if WINDOWS
@@ -19,6 +20,7 @@ int main(void) {
 #define THREAD_COUNT 8
 #define WINDOW_TILES 8 // Tiles read per level: a window of WINDOW_TILES x WINDOW_TILES around the center.
 #define SHARED_CACHE_SIZE 64
+#define SHARED_CACHE_BYTES (32 << 20)
 
 typedef struct tile_ref_t {
     int32_t level;
@@ -80,11 +82,10 @@ static void* read_all_shuffled(void* arg) {
     return NULL;
 }
 
-static isyntax_t* open_with_cache(const char* path, int32_t cache_size, isyntax_cache_t** cache) {
+static isyntax_t* open_with_cache(const char* path, isyntax_cache_t* cache) {
     isyntax_t* isyntax = NULL;
     if (libisyntax_open(path, 0, &isyntax) != LIBISYNTAX_OK) return NULL;
-    if (libisyntax_cache_create("concurrent_read_test", cache_size, cache) != LIBISYNTAX_OK) return NULL;
-    if (libisyntax_cache_inject(*cache, isyntax) != LIBISYNTAX_OK) return NULL;
+    if (libisyntax_cache_inject(cache, isyntax) != LIBISYNTAX_OK) return NULL;
     return isyntax;
 }
 
@@ -97,7 +98,8 @@ int main(int argc, char** argv) {
 
     // Reference pixels, read by one thread with a cache holding every tile.
     isyntax_cache_t* reference_cache = NULL;
-    isyntax_t* reference = open_with_cache(argv[1], 1 << 20, &reference_cache);
+    if (libisyntax_cache_create("reference", 1 << 20, &reference_cache) != LIBISYNTAX_OK) return 1;
+    isyntax_t* reference = open_with_cache(argv[1], reference_cache);
     if (!reference) return 1;
     const isyntax_image_t* wsi = libisyntax_get_wsi_image(reference);
     int32_t level_count = libisyntax_image_get_level_count(wsi);
@@ -122,15 +124,17 @@ int main(int argc, char** argv) {
     }
     free(pixels);
 
-    // The same tiles, read in a different order by every thread, through one small cache.
+    // The same tiles, read in a different order by every thread, through one small cache shared by two isyntax.
     isyntax_cache_t* shared_cache = NULL;
-    isyntax_t* shared = open_with_cache(argv[1], SHARED_CACHE_SIZE, &shared_cache);
-    if (!shared) return 1;
+    if (libisyntax_cache_create("shared", 1 << 20, &shared_cache) != LIBISYNTAX_OK) return 1;
+    if (libisyntax_cache_set_capacity_bytes(shared_cache, SHARED_CACHE_BYTES) != LIBISYNTAX_OK) return 1;
+    isyntax_t* shared[2] = {open_with_cache(argv[1], shared_cache), open_with_cache(argv[1], shared_cache)};
+    if (!shared[0] || !shared[1]) return 1;
     reader_t readers[THREAD_COUNT];
     pthread_t threads[THREAD_COUNT];
     for (int i = 0; i < THREAD_COUNT; ++i) {
-        readers[i] = (reader_t){.isyntax = shared, .cache = shared_cache, .tiles = tiles, .tile_count = tile_count,
-                                .seed = 1234u + i};
+        readers[i] = (reader_t){.isyntax = shared[i % 2], .cache = shared_cache, .tiles = tiles,
+                                .tile_count = tile_count, .seed = 1234u + i};
         if (pthread_create(&threads[i], NULL, read_all_shuffled, &readers[i]) != 0) return 1;
     }
     int mismatches = 0;
@@ -139,8 +143,34 @@ int main(int argc, char** argv) {
         mismatches += readers[i].mismatches;
     }
     printf("%d threads read %d tiles each, %d differ from a single thread\n", THREAD_COUNT, tile_count, mismatches);
+    int64_t used = libisyntax_cache_get_used_bytes(shared_cache);
+    if (used > SHARED_CACHE_BYTES) {
+        fprintf(stderr, "the cache holds %lld bytes, over its capacity\n", (long long)used);
+        ++mismatches;
+    }
 
-    libisyntax_close(shared);
+    // Flushing one isyntax frees its coefficients, not those of the other.
+    libisyntax_cache_flush(shared_cache, NULL);
+    uint32_t* top_pixels = malloc(sizeof(uint32_t) * libisyntax_get_tile_width(reference) *
+                                  libisyntax_get_tile_height(reference));
+    const tile_ref_t* top = NULL; // The last tile read that holds data.
+    for (int i = tile_count - 1; i >= 0 && libisyntax_cache_get_used_bytes(shared_cache) == 0; --i) {
+        top = &tiles[i];
+        read_tile_hash(shared[0], shared_cache, top, top_pixels);
+    }
+    int64_t used_by_first = libisyntax_cache_get_used_bytes(shared_cache);
+    read_tile_hash(shared[1], shared_cache, top, top_pixels);
+    libisyntax_cache_flush(shared_cache, shared[1]);
+    if (used_by_first == 0 || libisyntax_cache_get_used_bytes(shared_cache) != used_by_first) {
+        fprintf(stderr, "flushing the second isyntax left %lld bytes, the first one used %lld\n",
+                (long long)libisyntax_cache_get_used_bytes(shared_cache), (long long)used_by_first);
+        ++mismatches;
+    }
+    free(top_pixels);
+
+    libisyntax_close(shared[1]);
+    libisyntax_cache_flush(shared_cache, shared[0]);
+    libisyntax_close(shared[0]);
     libisyntax_cache_destroy(shared_cache);
     libisyntax_close(reference);
     libisyntax_cache_destroy(reference_cache);
