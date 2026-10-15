@@ -291,6 +291,7 @@ isyntax_error_t libisyntax_cache_create(const char* debug_name_or_null, int32_t 
     tile_list_init(&cache_ptr->cache_list, debug_name_or_null);
     cache_ptr->target_cache_size = cache_size;
     platform_mutex_init(&cache_ptr->mutex);
+    platform_cond_init(&cache_ptr->tile_ready);
 
     // Note: rest of initialization is deferred to the first injection, as that is where we will know the block size.
 
@@ -352,6 +353,7 @@ void libisyntax_cache_destroy(isyntax_cache_t* isyntax_cache) {
         }
     }
 
+    platform_cond_destroy(&isyntax_cache->tile_ready);
     platform_mutex_destroy(&isyntax_cache->mutex);
     free(isyntax_cache);
 }

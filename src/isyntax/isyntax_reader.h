@@ -14,6 +14,7 @@ typedef struct isyntax_tile_list_t {
 typedef struct isyntax_cache_t {
     isyntax_tile_list_t cache_list;
     platform_mutex_t mutex;
+    platform_cond_t tile_ready; // Signaled when a read finishes decoding or transforming tiles.
     // TODO(avirodov): int refcount;
     int target_cache_size;
     block_allocator_t* ll_coeff_block_allocator;
